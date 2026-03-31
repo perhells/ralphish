@@ -90,3 +90,13 @@ Each task has the following fields:
 | `blocked_by`  | List of task IDs that must be completed before this task can start  |
 
 `next_id` tracks the next available ID for new tasks. `ralphish` picks the first `todo` task in the list whose `blocked_by` dependencies are all `done`.
+
+### Creating tasks with Claude Code skills
+
+The [perhells/skills](https://github.com/perhells/skills) collection includes skills that work well as a pipeline for producing `progress.yaml` tasks:
+
+1. **`/grill-me`** — Stress-test your plan or design through an interactive interview, resolving ambiguities before any code is written.
+2. **`/write-a-prd`** — Turn the refined plan into a structured PRD through codebase exploration and module design.
+3. **`/prd-to-local-implementation-plan`** — Convert the PRD into concrete implementation tasks in `progress.yaml` format, ready for `ralphish` to execute.
+
+Install the skills and run them in sequence to go from idea to runnable task list.
