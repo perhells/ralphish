@@ -11,5 +11,6 @@ docker build -q -t "$IMAGE_NAME" "$SCRIPT_DIR" >/dev/null
 echo "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 ln -sf "$SCRIPT_DIR/ralphish" "$INSTALL_DIR/ralphish"
+ln -sf "$SCRIPT_DIR/stream-claude-json.py" "$INSTALL_DIR/stream-claude-json.py"
 
 echo "Done. Make sure $INSTALL_DIR is in your PATH."
