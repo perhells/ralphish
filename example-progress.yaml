@@ -1,0 +1,40 @@
+next_id: 6
+tasks:
+  - id: 1
+    title: Add rate limiting middleware
+    description: |
+      Add a token bucket rate limiter as HTTP middleware.
+      Configurable per-route limits via environment variables.
+      Return 429 with Retry-After header when exceeded.
+    status: done
+    blocked_by: []
+  - id: 2
+    title: Add structured JSON logging
+    description: |
+      Replace fmt.Printf calls with slog structured logger.
+      Include request_id, method, path, status, and duration on every request.
+      Log to stdout in JSON format.
+    status: done
+    blocked_by: []
+  - id: 3
+    title: Add health check endpoint
+    description: |
+      Add GET /healthz that returns 200 with JSON body containing service version,
+      uptime, and dependency connectivity (database, cache).
+      Used by container orchestrator liveness/readiness probes.
+    status: done
+    blocked_by: []
+  - id: 4
+    title: Add request ID propagation
+    description: |
+      Generate a UUID request ID in middleware if X-Request-Id header is not present.
+      Propagate it via context to all downstream calls and include it in responses.
+    status: todo
+    blocked_by: [2]
+  - id: 5
+    title: Add graceful shutdown
+    description: |
+      On SIGTERM/SIGINT, stop accepting new connections, drain in-flight requests
+      with a configurable timeout, then close database and cache connections.
+    status: todo
+    blocked_by: [3]

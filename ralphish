@@ -1,0 +1,135 @@
+#!/bin/bash
+set -e
+set -o pipefail
+
+IMAGE_NAME="claude-ralph"
+
+MODE="claude"
+WORKSPACE=""
+NEW=false
+MAX_ITERATIONS=1
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    --help)
+        usage
+        exit 0
+        ;;
+    --new)
+        NEW=true
+        shift
+        ;;
+    --rm)
+        MODE="rm"
+        shift
+        ;;
+    --max-iterations)
+        shift
+        if [ -z "$1" ]; then
+          echo "Usage: --max-iterations <iterations>"
+          exit 1
+        fi
+        MAX_ITERATIONS="$1"
+        shift
+        ;;
+    *)
+        WORKSPACE="$1"
+        shift
+        ;;
+    esac
+done
+
+if [ -z "$WORKSPACE" ]; then
+    WORKSPACE="."
+fi
+
+if [ -z "$CC_TOKEN" ] && [ "$MODE" != "rm" ]; then
+    echo "Error: CC_TOKEN environment variable is not set"
+    exit 1
+fi
+
+WORKSPACE="$(cd "$WORKSPACE" && pwd)"
+BASENAME="$(basename "$WORKSPACE")"
+
+# Truncate sandbox name to avoid Unix socket path length limits
+# Docker uses: ~/.docker/sandboxes/vm/<name>/eth (max ~94 chars total)
+MAX_NAME_LEN=40
+if [ ${#BASENAME} -gt $MAX_NAME_LEN ]; then
+    HASH=$(echo -n "$BASENAME" | shasum | cut -c1-6)
+    BASENAME="${BASENAME:0:$((MAX_NAME_LEN - 7))}-$HASH"
+fi
+SANDBOX="claude-$BASENAME"
+
+case "$MODE" in
+rm)
+    echo "Removing sandbox: $SANDBOX"
+    docker sandbox rm "$SANDBOX" 2>&1 || echo "Failed to remove sandbox (may not exist)"
+    ;;
+*)
+    if [ "$NEW" = true ]; then
+        echo "Removing sandbox: $SANDBOX"
+        docker sandbox rm "$SANDBOX" 2>/dev/null || true
+    fi
+
+    CREATE_OUTPUT=$(docker sandbox create -q --name "$SANDBOX" --template "$IMAGE_NAME" claude "$WORKSPACE" 2>&1 || true)
+    if echo "$CREATE_OUTPUT" | grep -q "already exists"; then
+        echo "Resuming sandbox: $SANDBOX"
+    elif [ -z "$CREATE_OUTPUT" ]; then
+        echo "Created sandbox: $SANDBOX"
+    else
+        echo "$CREATE_OUTPUT"
+    fi
+
+    CLAUDE_PROMPT='
+        1. Find the highest priority task from progress.yaml
+        2. Implement the task
+        3. Run all tests/checks for the project and fix any problems
+        4. Append your progress to progress.yaml
+        5. If all tasks are complete, output <promise>COMPLETE</promise>
+
+        You MUST:
+        - Only work on a single task
+        - Always use a feature branch for development, create it if the branch does not exist
+        - A feature branch can be based on the projects default branch or another feature branch
+        - Commit one change at a time to the feature branch
+        - Never commit the progress file
+    '
+
+    TMPFILE=$(mktemp)
+    cleanup() {
+        trap - INT TERM
+        echo ""
+        echo "Interrupted — aborting sandbox: $SANDBOX"
+        pkill -P $$ 2>/dev/null || true
+        docker sandbox stop "$SANDBOX" &>/dev/null &
+        rm -f "$TMPFILE"
+        exit 130
+    }
+    trap cleanup INT TERM
+    trap 'rm -f "$TMPFILE"' EXIT
+    for ((i=1; i<=MAX_ITERATIONS; i++)); do
+        echo "Starting iteration: $i"
+
+        docker sandbox exec -t "$SANDBOX" bash -c "
+            source ~/.claude/setup.sh &&
+            export CLAUDE_CODE_OAUTH_TOKEN='$CC_TOKEN' &&
+            cd '$WORKSPACE' &&
+            claude --dangerously-skip-permissions -p --output-format stream-json --verbose '$CLAUDE_PROMPT' 2>&1
+        " | tee "$TMPFILE" | python3 -u "$(dirname "$0")/stream-claude-json.py" &
+        pid=$!
+
+        rc=0
+        wait "$pid" || rc=$?
+        if [ $rc -ne 0 ] && ! grep -q '<promise>COMPLETE</promise>' "$TMPFILE"; then
+            echo "Sandbox exec failed (exit code $rc)"
+            exit $rc
+        fi
+
+      if grep -q '<promise>COMPLETE</promise>' "$TMPFILE"; then
+        echo "PRD complete after $i iterations."
+        exit 0
+      fi
+    done
+    echo "Reached max iteration count"
+    ;;
+esac
