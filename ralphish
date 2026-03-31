@@ -96,8 +96,10 @@ rm)
     '
 
     TMPFILE=$(mktemp)
+    printf '\033[?25l'  # hide cursor
     cleanup() {
         trap - INT TERM
+        printf '\033[?25h'  # restore cursor
         echo ""
         echo "Interrupted — aborting sandbox: $SANDBOX"
         pkill -P $$ 2>/dev/null || true
@@ -106,7 +108,7 @@ rm)
         exit 130
     }
     trap cleanup INT TERM
-    trap 'rm -f "$TMPFILE"' EXIT
+    trap 'printf "\033[?25h"; rm -f "$TMPFILE"' EXIT
     for ((i=1; i<=MAX_ITERATIONS; i++)); do
         echo "Starting iteration: $i"
 
