@@ -110,14 +110,12 @@ rm)
     trap cleanup INT TERM
     trap 'printf "\033[?25h"; rm -f "$TMPFILE"' EXIT
     for ((i=1; i<=MAX_ITERATIONS; i++)); do
-        echo "Starting iteration: $i"
-
         docker sandbox exec -t "$SANDBOX" bash -c "
             source ~/.claude/setup.sh &&
             export CLAUDE_CODE_OAUTH_TOKEN='$CC_TOKEN' &&
             cd '$WORKSPACE' &&
             claude --dangerously-skip-permissions -p --output-format stream-json --verbose '$CLAUDE_PROMPT' 2>&1
-        " | tee "$TMPFILE" | python3 -u "$(dirname "$0")/stream-claude-json.py" &
+        " | tee "$TMPFILE" | python3 -u "$(dirname "$0")/stream-claude-json.py" --iteration "$i" --max "$MAX_ITERATIONS" --sandbox "$SANDBOX" --workspace "$WORKSPACE" &
         pid=$!
 
         rc=0

@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Filter Claude stream-json output to match Claude Code's terminal format."""
+import argparse
 import json
 import shutil
 import sys
 import textwrap
+from datetime import datetime
 
 DIM = "\033[2m"
 RESET = "\033[0m"
+BOLD = "\033[1m"
 BLUE = "\033[34m"
 CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
 
 last_type = None
 pending_tools = {}  # tool_use_id -> formatted tool header text
@@ -23,20 +29,29 @@ def term_cols():
     return shutil.get_terminal_size((80, 24)).columns
 
 
-def box_line(corner):
-    """Return a horizontal box line like ╭───… filling terminal width."""
+def box_width():
+    """Inner content width: cols - 2 indent - 2 border - 2 padding - 1 safety."""
+    return max(term_cols() - 7, 20)
+
+
+def box_line(left, right):
+    """Return a horizontal box line like ╭───…───╮ filling terminal width."""
     cols = term_cols()
-    # 2 spaces indent + 1 corner char = 3 visible chars before the dashes
-    fill = cols - 3 - 1  # -1 to avoid filling the last column (which suppresses newline)
-    return f"{DIM}{corner}{'─' * max(fill, 1)}{RESET}"
+    # 2 indent + left corner + dashes + right corner = cols - 1
+    fill = cols - 5  # 2 indent + 2 corners + 1 safety
+    return f"{DIM}{left}{'─' * max(fill, 1)}{right}{RESET}"
+
+
+def box_row(text, style=""):
+    """Return a row like │ text   │ padded to fill the box."""
+    bw = box_width()
+    padded = text.ljust(bw)[:bw]
+    return f"{DIM}│{RESET} {style}{padded}{RESET} {DIM}│{RESET}"
 
 
 def wrap_in_box(text):
-    """Wrap text to fit inside box, returning lines prefixed with │."""
-    # Available width: terminal - 2 indent - 1 pipe - 1 space = cols - 4
-    width = term_cols() - 4
-    wrapped = textwrap.wrap(text, width=max(width, 20), break_on_hyphens=False)
-    return wrapped
+    """Wrap text to fit inside box, returning wrapped lines."""
+    return textwrap.wrap(text, width=max(box_width(), 20), break_on_hyphens=False)
 
 
 HIDDEN_KEYS = {"old_string", "new_string"}
@@ -55,6 +70,56 @@ def format_tool_args(inp):
             parts.append(f"{k}: {v}")
     return ", ".join(parts)
 
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--iteration", type=int, default=1)
+parser.add_argument("--max", type=int, default=1)
+parser.add_argument("--sandbox", type=str, default="")
+parser.add_argument("--workspace", type=str, default="")
+args = parser.parse_args()
+
+
+def box_border(left, right, label=""):
+    """Draw a horizontal border, optionally with a centered label."""
+    cols = term_cols()
+    fill = cols - 5
+    if label:
+        dashes = fill - len(label)
+        ld = dashes // 2
+        rd = dashes - ld
+        return f"{BOLD}{MAGENTA}{left}{'─' * ld}{label}{'─' * rd}{right}{RESET}"
+    return f"{BOLD}{MAGENTA}{left}{'─' * fill}{right}{RESET}"
+
+
+def box_content(left, right="", style=DIM):
+    """Draw a content row with optional right-aligned text."""
+    cols = term_cols()
+    inner = cols - 7  # 2 indent + 2 borders + 2 padding + 1 safety
+    if right:
+        gap = inner - len(left) - len(right)
+        text = left + (" " * max(gap, 1)) + right
+    else:
+        text = left
+    return f"{BOLD}{MAGENTA}│{RESET} {style}{text.ljust(inner)[:inner]}{RESET} {BOLD}{MAGENTA}│{RESET}"
+
+
+def print_start_box():
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    title = f" Iteration {args.iteration}/{args.max} "
+    workspace = args.workspace or "unknown"
+
+    rows = [
+        box_content(f"Sandbox: {args.sandbox}"),
+        box_content(f"Workspace: {workspace}", timestamp),
+    ]
+
+    w(f"\n  {box_border('╭', '╮', title)}\n")
+    for row in rows:
+        w(f"  {row}\n")
+    w(f"  {box_border('╰', '╯')}\n")
+
+
+print_start_box()
 
 for line in sys.stdin:
     try:
@@ -106,28 +171,30 @@ for line in sys.stdin:
                 tool_text = pending_tools.pop(tool_id, None)
 
                 # Print tool header
-                w(f"\n  {box_line('╭')}")
+                w(f"\n  {box_line('╭', '╮')}")
                 if tool_text:
-                    wrapped = wrap_in_box(tool_text)
-                    for i, tl in enumerate(wrapped):
-                        if i == 0:
-                            w(f"\n  {DIM}│{RESET} {CYAN}{tl}{RESET}")
-                        else:
-                            w(f"\n  {DIM}│   {tl}{RESET}")
+                    for tl in wrap_in_box(tool_text):
+                        w(f"\n  {box_row(tl, CYAN)}")
 
                 # Print result content
                 content = block.get("content", "")
                 if isinstance(content, str) and content:
                     lines = content.strip().split("\n")
+                    lines = [l.expandtabs(4) for l in lines]
                     max_lines = 10
                     shown = lines[:max_lines]
-                    w(f"\n  {box_line('├')}")
+                    w(f"\n  {box_line('├', '┤')}")
+                    bw = box_width()
                     for l in shown:
-                        w(f"\n  {DIM}│{RESET} {DIM}{l}{RESET}")
+                        if len(l) > bw:
+                            for wl in textwrap.wrap(l, width=bw, break_on_hyphens=False):
+                                w(f"\n  {box_row(wl, DIM)}")
+                        else:
+                            w(f"\n  {box_row(l, DIM)}")
                     if len(lines) > max_lines:
-                        w(f"\n  {DIM}│ … {len(lines) - max_lines} more lines{RESET}")
+                        w(f"\n  {box_row(f'… {len(lines) - max_lines} more lines', DIM)}")
 
-                w(f"\n  {box_line('╰')}")
+                w(f"\n  {box_line('╰', '╯')}")
                 last_type = "tool_result"
 
     elif t == "result":
