@@ -92,7 +92,6 @@ rm)
         - Always use a feature branch for development, create it if the branch does not exist
         - A feature branch can be based on the projects default branch or another feature branch
         - Commit one change at a time to the feature branch
-        - Never commit the progress file
     '
 
     TMPFILE=$(mktemp)
