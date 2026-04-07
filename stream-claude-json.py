@@ -55,10 +55,26 @@ def wrap_in_box(text):
 
 
 HIDDEN_KEYS = {"old_string", "new_string", "replace_all", "file_path"}
+BASH_HIDDEN_KEYS = {"command", "description", "timeout", "run_in_background"}
 
 
 def format_tool_args(name, inp):
     parts = []
+    # For Bash, show description as prefix and just the command unquoted
+    if name == "Bash":
+        prefix = inp.get("description", "")
+        command = inp.get("command", "")
+        inner_parts = [command]
+        for k, v in inp.items():
+            if k in BASH_HIDDEN_KEYS:
+                continue
+            if isinstance(v, str):
+                inner_parts.append(f'{k}: "{v}"')
+            elif isinstance(v, bool):
+                inner_parts.append(f"{k}: {'true' if v else 'false'}")
+            elif isinstance(v, (int, float)):
+                inner_parts.append(f"{k}: {v}")
+        return prefix, ", ".join(inner_parts)
     # For tools with file_path, show just the filename unquoted as the first arg
     if "file_path" in inp:
         filename = inp["file_path"].rsplit("/", 1)[-1]
@@ -72,7 +88,7 @@ def format_tool_args(name, inp):
             parts.append(f"{k}: {'true' if v else 'false'}")
         elif isinstance(v, (int, float)):
             parts.append(f"{k}: {v}")
-    return ", ".join(parts)
+    return None, ", ".join(parts)
 
 
 parser = argparse.ArgumentParser()
@@ -162,8 +178,11 @@ for line in sys.stdin:
                 tool_id = block.get("id", "")
                 name = block.get("name", "")
                 inp = block.get("input", {})
-                args = format_tool_args(name, inp)
-                tool_text = f"{name}({args})"
+                prefix, args = format_tool_args(name, inp)
+                if prefix:
+                    tool_text = f"{prefix} ({args})"
+                else:
+                    tool_text = f"{name}({args})"
                 pending_tools[tool_id] = tool_text
                 last_type = "tool_use"
 
