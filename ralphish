@@ -2,12 +2,13 @@
 set -e
 set -o pipefail
 
-IMAGE_NAME="claude-ralph"
-
 MODE="claude"
 WORKSPACE=""
 NEW=false
 MAX_ITERATIONS=1
+INCLUDE_LOCAL_CONFIG=false
+CUSTOM_ENV=()
+ENV_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -30,6 +31,34 @@ while [[ $# -gt 0 ]]; do
           exit 1
         fi
         MAX_ITERATIONS="$1"
+        shift
+        ;;
+    --env=*)
+        CUSTOM_ENV+=("${1#--env=}")
+        shift
+        ;;
+    --env)
+        if [ -z "$2" ]; then
+            echo "Error: --env requires a KEY=VALUE argument"
+            exit 1
+        fi
+        CUSTOM_ENV+=("$2")
+        shift 2
+        ;;
+    --env-file=*)
+        ENV_FILE="${1#--env-file=}"
+        shift
+        ;;
+    --env-file)
+        if [ -z "$2" ]; then
+            echo "Error: --env-file requires a file path argument"
+            exit 1
+        fi
+        ENV_FILE="$2"
+        shift 2
+        ;;
+    --include-local-config)
+        INCLUDE_LOCAL_CONFIG=true
         shift
         ;;
     *)
@@ -62,23 +91,19 @@ SANDBOX="claude-$BASENAME"
 
 case "$MODE" in
 rm)
-    echo "Removing sandbox: $SANDBOX"
-    docker sandbox rm "$SANDBOX" 2>&1 || echo "Failed to remove sandbox (may not exist)"
+    sandbox --rm "$WORKSPACE"
     ;;
 *)
-    if [ "$NEW" = true ]; then
-        echo "Removing sandbox: $SANDBOX"
-        docker sandbox rm "$SANDBOX" 2>/dev/null || true
-    fi
+    # Build sandbox args to pass through for lifecycle management
+    SANDBOX_ARGS=()
+    [ "$NEW" = true ] && SANDBOX_ARGS+=(--new)
+    [ "$INCLUDE_LOCAL_CONFIG" = true ] && SANDBOX_ARGS+=(--include-local-config)
+    for env_var in "${CUSTOM_ENV[@]}"; do SANDBOX_ARGS+=(--env "$env_var"); done
+    [ -n "$ENV_FILE" ] && SANDBOX_ARGS+=(--env-file "$ENV_FILE")
 
-    CREATE_OUTPUT=$(docker sandbox create -q --name "$SANDBOX" --template "$IMAGE_NAME" claude "$WORKSPACE" 2>&1 || true)
-    if echo "$CREATE_OUTPUT" | grep -q "already exists"; then
-        echo "Resuming sandbox: $SANDBOX"
-    elif [ -z "$CREATE_OUTPUT" ]; then
-        echo "Created sandbox: $SANDBOX"
-    else
-        echo "$CREATE_OUTPUT"
-    fi
+    # Use sandbox to create/resume (and handle --new, --include-local-config, env)
+    # bash exits immediately when stdin closes; 2>/dev/null suppresses TTY warnings
+    sandbox "${SANDBOX_ARGS[@]}" --bash "$WORKSPACE" <<< 'exit 0' 2>/dev/null || true
 
     CLAUDE_PROMPT='
         1. Find the highest priority task from progress.yaml
@@ -109,12 +134,7 @@ rm)
     trap cleanup INT TERM
     trap 'printf "\033[?25h"; rm -f "$TMPFILE"' EXIT
     for ((i=1; i<=MAX_ITERATIONS; i++)); do
-        docker sandbox exec -t "$SANDBOX" bash -c "
-            source ~/.claude/setup.sh &&
-            export CLAUDE_CODE_OAUTH_TOKEN='$CC_TOKEN' &&
-            cd '$WORKSPACE' &&
-            claude --dangerously-skip-permissions -p --output-format stream-json --verbose '$CLAUDE_PROMPT' 2>&1
-        " | tee "$TMPFILE" | python3 -u "$(dirname "$0")/stream-claude-json.py" --iteration "$i" --max "$MAX_ITERATIONS" --sandbox "$SANDBOX" --workspace "$WORKSPACE" &
+        sandbox "${SANDBOX_ARGS[@]}" --prompt "$CLAUDE_PROMPT" "$WORKSPACE" | tee "$TMPFILE" | python3 -u "$(dirname "$0")/stream-claude-json.py" --iteration "$i" --max "$MAX_ITERATIONS" --sandbox "$SANDBOX" --workspace "$WORKSPACE" &
         pid=$!
 
         rc=0

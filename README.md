@@ -40,19 +40,25 @@ Output is streamed as JSON and piped through `stream-claude-json.py` for display
 
 ### Options
 
-| Flag               | Description                                          |
-| ------------------ | ---------------------------------------------------- |
-| --new              | Remove and recreate sandbox before running            |
-| --rm               | Remove the sandbox                                   |
-| --max-iterations N | Maximum number of iterations to run (default: 1)     |
+| Flag                   | Description                                                       |
+| ---------------------- | ----------------------------------------------------------------- |
+| --new                  | Remove and recreate sandbox before running                        |
+| --rm                   | Remove the sandbox                                                |
+| --max-iterations N     | Maximum number of iterations to run (default: 1)                  |
+| --env KEY=VALUE        | Pass environment variable to sandbox (can be used multiple times) |
+| --env-file FILE        | Load environment variables from a file                            |
+| --include-local-config | Copy local Claude plugins, skills, and settings into sandbox      |
 
 ### Examples
 
 ```
-ralphish ~/project                    # Run one iteration on ~/project
-ralphish --max-iterations 5 .         # Run up to 5 iterations on current directory
-ralphish --new --max-iterations 3 .   # Fresh sandbox, up to 3 iterations
-ralphish --rm .                       # Remove sandbox for current directory
+ralphish ~/project                           # Run one iteration on ~/project
+ralphish --max-iterations 5 .                # Run up to 5 iterations on current directory
+ralphish --new --max-iterations 3 .          # Fresh sandbox, up to 3 iterations
+ralphish --rm .                              # Remove sandbox for current directory
+ralphish --env GITHUB_TOKEN=ghp_xxxx .       # Pass a secret into the sandbox
+ralphish --env-file ~/.ralphish-secrets .    # Load secrets from a file
+ralphish --include-local-config .            # Run with your local Claude plugins and skills
 ```
 
 ### progress.yaml format
