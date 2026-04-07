@@ -54,11 +54,15 @@ def wrap_in_box(text):
     return textwrap.wrap(text, width=max(box_width(), 20), break_on_hyphens=False)
 
 
-HIDDEN_KEYS = {"old_string", "new_string"}
+HIDDEN_KEYS = {"old_string", "new_string", "replace_all", "file_path"}
 
 
-def format_tool_args(inp):
+def format_tool_args(name, inp):
     parts = []
+    # For tools with file_path, show just the filename unquoted as the first arg
+    if "file_path" in inp:
+        filename = inp["file_path"].rsplit("/", 1)[-1]
+        parts.append(filename)
     for k, v in inp.items():
         if k in HIDDEN_KEYS:
             continue
@@ -158,7 +162,7 @@ for line in sys.stdin:
                 tool_id = block.get("id", "")
                 name = block.get("name", "")
                 inp = block.get("input", {})
-                args = format_tool_args(inp)
+                args = format_tool_args(name, inp)
                 tool_text = f"{name}({args})"
                 pending_tools[tool_id] = tool_text
                 last_type = "tool_use"
