@@ -96,7 +96,15 @@ parser.add_argument("--iteration", type=int, default=1)
 parser.add_argument("--max", type=int, default=1)
 parser.add_argument("--sandbox", type=str, default="")
 parser.add_argument("--workspace", type=str, default="")
+parser.add_argument("--phase", type=str, default="", help="Phase name: worker, reviewer, orchestrator")
 args = parser.parse_args()
+
+PHASE_COLORS = {
+    "worker": CYAN,
+    "reviewer": YELLOW,
+    "orchestrator": GREEN,
+}
+phase_color = PHASE_COLORS.get(args.phase, MAGENTA)
 
 
 def box_border(left, right, label=""):
@@ -107,8 +115,8 @@ def box_border(left, right, label=""):
         dashes = fill - len(label)
         ld = dashes // 2
         rd = dashes - ld
-        return f"{BOLD}{MAGENTA}{left}{'─' * ld}{label}{'─' * rd}{right}{RESET}"
-    return f"{BOLD}{MAGENTA}{left}{'─' * fill}{right}{RESET}"
+        return f"{BOLD}{phase_color}{left}{'─' * ld}{label}{'─' * rd}{right}{RESET}"
+    return f"{BOLD}{phase_color}{left}{'─' * fill}{right}{RESET}"
 
 
 def box_content(left, right="", style=DIM):
@@ -120,12 +128,15 @@ def box_content(left, right="", style=DIM):
         text = left + (" " * max(gap, 1)) + right
     else:
         text = left
-    return f"{BOLD}{MAGENTA}│{RESET} {style}{text.ljust(inner)[:inner]}{RESET} {BOLD}{MAGENTA}│{RESET}"
+    return f"{BOLD}{phase_color}│{RESET} {style}{text.ljust(inner)[:inner]}{RESET} {BOLD}{phase_color}│{RESET}"
 
 
 def print_start_box():
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f" Iteration {args.iteration}/{args.max} "
+    if args.phase:
+        title = f" Iteration {args.iteration}/{args.max} — {args.phase.title()} "
+    else:
+        title = f" Iteration {args.iteration}/{args.max} "
     workspace = args.workspace or "unknown"
 
     rows = [

@@ -28,15 +28,68 @@ export CC_TOKEN=<token>
 ralphish [OPTIONS] [WORKSPACE]
 ```
 
-Runs Claude headlessly in a sandbox, iterating on tasks defined in a `progress.yaml` file in the workspace. On each iteration Claude will:
+Runs Claude headlessly in a sandbox, iterating on tasks defined in a `progress.yaml` file in the workspace.
 
-1. Find the next eligible task from `progress.yaml`
-2. Implement the task on a feature branch
-3. Run tests/checks and fix any problems
-4. Append progress to `progress.yaml`
-5. Stop when all tasks are complete
+### Architecture: three-phase iteration loop
 
-Output is streamed as JSON and piped through `stream-claude-json.py` for display.
+Each iteration runs three Claude phases on the same persistent sandbox:
+
+```
+for each iteration:
+    Sync         → fetch upstream, update base branch
+    Worker       → implement one task, write summary.yaml
+    Reviewer     → review the diff, write review.yaml
+    Orchestrator → update progress.yaml, write context.yaml
+    check COMPLETE or PAUSE
+```
+
+**Worker** picks the next eligible task (or the task assigned by the orchestrator via `context.yaml`), implements it on a feature branch, and writes `.ralphish/summary.yaml` with the task ID, base/head SHAs, branch name, and a description of what was done.
+
+**Reviewer** reads the summary, examines the exact diff (`git diff base_sha..head_sha`), and writes `.ralphish/review.yaml` with a verdict (`approve` or `request_changes`) and specific remarks.
+
+**Orchestrator** reads both artifacts, updates `progress.yaml` (marks tasks done, tracks retries, splits/blocks tasks), appends to the orchestration history log, and writes `.ralphish/context.yaml` with feedback for the next worker iteration. It can signal `COMPLETE` when all tasks are done or `PAUSE` when external action is needed.
+
+### Inter-phase communication
+
+Phase communication uses structured YAML files in `.ralphish/` (transient, wiped per invocation):
+
+| File | Written by | Read by | Content |
+|---|---|---|---|
+| `summary.yaml` | Worker | Reviewer, Orchestrator | Task ID, base/head SHAs, branch, what was done, findings |
+| `review.yaml` | Reviewer | Orchestrator | Verdict, task ID, SHAs, remarks |
+| `context.yaml` | Orchestrator | Worker (next iteration) | Assigned task ID, feedback, reviewer remarks |
+
+All durable state lives in `progress.yaml` (task statuses, retry counts, orchestration history).
+
+### Retry and escalation
+
+The orchestrator tracks consecutive review rejections per task via `retry_count` in `progress.yaml`. After 3 consecutive rejections, it escalates:
+
+1. **Split** the task into smaller subtasks (preferred)
+2. **Block** the task with an explanation
+3. **Skip** the task as a last resort
+
+### Pause and resume
+
+The orchestrator can pause the loop when external action is needed (PR merge, deployment, manual approval). On pause:
+
+1. All durable state is written to `progress.yaml`
+2. `ralphish` exits cleanly (exit code 0)
+3. The user performs the external action
+4. The user runs `ralphish` again to resume
+
+On resume, the sync phase fetches upstream and updates the local base branch. The `.ralphish/` directory is wiped (fresh transient state), but `progress.yaml` picks up where it left off.
+
+### Error handling
+
+All phases are fail-closed:
+
+| Phase | On failure | Detail |
+|---|---|---|
+| Sync | Continue (best-effort) | Network issues should not block local work |
+| Worker | Exit with error | No summary means nothing to review |
+| Reviewer | Retry once, then exit | Transient failures get one retry; missing review never silently skipped |
+| Orchestrator | Exit with error | State must be updated before next iteration |
 
 ### Options
 
@@ -76,6 +129,11 @@ tasks:
       Return 429 with Retry-After header when exceeded.
     status: done
     blocked_by: []
+    parent_id: null
+    branch: feature/rate-limiting
+    head_sha: abc1234
+    retry_count: 0
+    last_rejection: null
   - id: 4
     title: Add request ID propagation
     description: |
@@ -83,19 +141,44 @@ tasks:
       Propagate it via context to all downstream calls and include it in responses.
     status: todo
     blocked_by: [2]
+
+orchestration:
+  last_sync_sha: def5678
+  history:
+    - iteration: 1
+      task_id: 1
+      verdict: approve
+      summary: "Implemented rate limiter middleware"
+      decision: done
 ```
 
-Each task has the following fields:
+#### Task fields
 
-| Field         | Description                                                        |
-| ------------- | ------------------------------------------------------------------ |
-| `id`          | Unique integer identifier                                          |
-| `title`       | Short name for the task                                            |
-| `description` | Detailed description of what to implement                          |
-| `status`      | `todo` or `done`                                                   |
-| `blocked_by`  | List of task IDs that must be completed before this task can start  |
+| Field            | Description                                                        |
+| ---------------- | ------------------------------------------------------------------ |
+| `id`             | Unique integer identifier                                          |
+| `title`          | Short name for the task                                            |
+| `description`    | Detailed description of what to implement                          |
+| `status`         | `todo`, `done`, `blocked`, or `skipped`                            |
+| `blocked_by`     | List of task IDs that must be completed before this task can start  |
+| `parent_id`      | If split from another task, the parent task's ID (null otherwise)  |
+| `branch`         | Feature branch name (null until work starts)                       |
+| `head_sha`       | Last known commit SHA on the feature branch (null until committed) |
+| `retry_count`    | Consecutive review rejections for current attempt (default: 0)     |
+| `last_rejection` | Summary of last rejection reason (null if none)                    |
 
-`next_id` tracks the next available ID for new tasks. `ralphish` picks the first `todo` task in the list whose `blocked_by` dependencies are all `done`.
+`next_id` tracks the next available ID for new tasks. `ralphish` picks the first `todo` task whose `blocked_by` dependencies are all `done`.
+
+New fields (`parent_id`, `branch`, `head_sha`, `retry_count`, `last_rejection`) are optional — existing `progress.yaml` files without them work fine (missing fields default to zero values).
+
+#### Orchestration section
+
+| Field                       | Description                                            |
+| --------------------------- | ------------------------------------------------------ |
+| `orchestration.last_sync_sha` | Base branch SHA at last sync                         |
+| `orchestration.history[]`   | Append-only log of iteration outcomes                  |
+
+The `orchestration` section is created automatically on first run if absent.
 
 ### Creating tasks with Claude Code skills
 
