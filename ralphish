@@ -2,7 +2,8 @@
 set -e
 set -o pipefail
 
-MODE="claude"
+MODE="run"
+AGENT="claude"
 WORKSPACE=""
 NEW=false
 MAX_ITERATIONS=1
@@ -10,11 +11,75 @@ INCLUDE_LOCAL_CONFIG=false
 CUSTOM_ENV=()
 ENV_FILE=""
 
+usage() {
+    cat <<'EOF'
+Usage: ralphish [OPTIONS] [WORKSPACE]
+
+Options:
+      --claude                     Run Claude (default)
+      --codex                      Run Codex
+      --agent AGENT                Select claude or codex
+      --new                        Remove and recreate sandbox before running
+      --rm                         Remove the sandbox for this workspace
+      --max-iterations N           Maximum iterations to run (default: 1)
+      --env KEY=VALUE              Pass environment variable to sandbox (repeatable)
+      --env-file FILE              Load environment variables from a file
+      --include-local-config       Sync local agent config into sandbox
+      --help                       Show this help
+EOF
+}
+
+has_forwarded_env_key() {
+    local key="$1"
+    local env_var
+    local line
+    local entry_key
+
+    for env_var in "${CUSTOM_ENV[@]}"; do
+        if [ "${env_var%%=*}" = "$key" ]; then
+            return 0
+        fi
+    done
+
+    if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [ -z "${line//[[:space:]]/}" ] && continue
+            entry_key="${line%%=*}"
+            if [ "$entry_key" = "$key" ]; then
+                return 0
+            fi
+        done < "$ENV_FILE"
+    fi
+
+    return 1
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
     --help)
         usage
         exit 0
+        ;;
+    --claude)
+        AGENT="claude"
+        shift
+        ;;
+    --codex)
+        AGENT="codex"
+        shift
+        ;;
+    --agent=*)
+        AGENT="${1#--agent=}"
+        shift
+        ;;
+    --agent)
+        if [ -z "$2" ]; then
+            echo "Error: --agent requires a value"
+            exit 1
+        fi
+        AGENT="$2"
+        shift 2
         ;;
     --new)
         NEW=true
@@ -72,15 +137,42 @@ if [ -z "$WORKSPACE" ]; then
     WORKSPACE="."
 fi
 
-if [ -z "$CC_TOKEN" ] && [ "$MODE" != "rm" ]; then
-    echo "Error: CC_TOKEN environment variable is not set"
+case "$AGENT" in
+claude|codex) ;;
+*)
+    echo "Error: unsupported agent '$AGENT' (expected claude or codex)"
+    usage
     exit 1
+    ;;
+esac
+
+if [ -n "$ENV_FILE" ] && [ ! -f "$ENV_FILE" ]; then
+    echo "Error: env file not found: $ENV_FILE"
+    exit 1
+fi
+
+if [ "$MODE" != "rm" ]; then
+    case "$AGENT" in
+    claude)
+        if [ -z "$CC_TOKEN" ]; then
+            echo "Error: CC_TOKEN environment variable is not set"
+            exit 1
+        fi
+        ;;
+    codex)
+        if [ -z "$OPENAI_API_KEY" ] && ! has_forwarded_env_key "OPENAI_API_KEY" && [ ! -f "$HOME/.codex/auth.json" ]; then
+            echo "Error: Codex auth not found"
+            echo "Run 'codex login' locally, set OPENAI_API_KEY in your shell, or pass it with --env/--env-file"
+            exit 1
+        fi
+        ;;
+    esac
 fi
 
 CONFIG_DIR="$(cd "$WORKSPACE" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Compute a sandbox name from a directory path
+# Compute a sandbox name from a directory path and selected agent
 compute_sandbox_name() {
     local dir="$1"
     local bn
@@ -91,13 +183,13 @@ compute_sandbox_name() {
         hash=$(echo -n "$bn" | shasum | cut -c1-6)
         bn="${bn:0:$((max - 7))}-$hash"
     fi
-    echo "claude-$bn"
+    echo "$AGENT-$bn"
 }
 
 case "$MODE" in
 rm)
     # Remove sandbox for the config directory
-    sandbox --rm "$CONFIG_DIR"
+    sandbox --agent "$AGENT" --rm "$CONFIG_DIR"
     # Also remove sandboxes for any repo-scoped tasks
     if [ -f "$CONFIG_DIR/progress.yaml" ]; then
         REPOS=$(python3 "$SCRIPT_DIR/select-task.py" "$CONFIG_DIR" --repos 2>/dev/null) || true
@@ -105,7 +197,7 @@ rm)
             [ -z "$repo" ] && continue
             repo_path="$(cd "$CONFIG_DIR" && cd "$repo" && pwd 2>/dev/null)" || continue
             [ "$repo_path" = "$CONFIG_DIR" ] && continue
-            sandbox --rm "$repo_path" 2>/dev/null || true
+            sandbox --agent "$AGENT" --rm "$repo_path" 2>/dev/null || true
         done <<< "$REPOS"
     fi
     ;;
@@ -296,14 +388,15 @@ You MUST:
         docker sandbox exec "$SANDBOX" bash -c "cd '$WORK_DIR' && $1"
     }
 
-    # Run a Claude phase in the sandbox and stream output through the formatter
+    # Run an agent phase in the sandbox and stream output through the formatter
     run_phase() {
         local phase="$1"
         local prompt="$2"
 
-        sandbox "${PHASE_ARGS[@]}" --prompt "$prompt" "$WORK_DIR" | \
+        sandbox --agent "$AGENT" "${PHASE_ARGS[@]}" --prompt "$prompt" "$WORK_DIR" | \
             tee "$TMPFILE" | \
             python3 -u "$SCRIPT_DIR/stream-claude-json.py" \
+                --agent "$AGENT" \
                 --iteration "$i" --max "$MAX_ITERATIONS" \
                 --sandbox "$SANDBOX" --workspace "$WORK_DIR" \
                 --phase "$phase" &
@@ -402,7 +495,7 @@ You MUST:
         if ! echo "$INITIALIZED_SANDBOXES" | grep -qF ":${SANDBOX}:"; then
             INIT_ARGS=("${PHASE_ARGS[@]}" "${SANDBOX_INIT_EXTRA[@]}")
             [ "$NEW" = true ] && INIT_ARGS+=(--new)
-            sandbox "${INIT_ARGS[@]}" --bash "$WORK_DIR" <<< 'exit 0' 2>/dev/null || true
+            sandbox --agent "$AGENT" "${INIT_ARGS[@]}" --bash "$WORK_DIR" <<< 'exit 0' 2>/dev/null || true
             INITIALIZED_SANDBOXES="${INITIALIZED_SANDBOXES}:${SANDBOX}:"
         fi
 

@@ -1,6 +1,6 @@
 # ralphish
 
-A headless agentic task runner built on [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) which handles Claude Code authentication. This avoids interactive login when creating new sandboxes.
+A headless agentic task runner built on [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) which can run either Claude Code or Codex in a persistent sandbox.
 
 ## Installation
 
@@ -12,14 +12,23 @@ This builds the Docker image and installs `ralphish` to `~/.local/bin`.
 
 ## Setup
 
-Generate an OAuth token and add it to your shell profile:
+Claude mode uses a Claude Code OAuth token:
 
 ```
 claude setup-token
+export CC_TOKEN=<token>
 ```
 
+Codex mode uses either a local Codex login or an API key:
+
 ```
-export CC_TOKEN=<token>
+codex login
+```
+
+or:
+
+```
+export OPENAI_API_KEY=<token>
 ```
 
 ## ralphish
@@ -28,11 +37,11 @@ export CC_TOKEN=<token>
 ralphish [OPTIONS] [WORKSPACE]
 ```
 
-Runs Claude headlessly in a sandbox, iterating on tasks defined in a `progress.yaml` file in the workspace.
+Runs the selected agent headlessly in a sandbox, iterating on tasks defined in a `progress.yaml` file in the workspace. Claude is the default; use `--codex` or `--agent codex` to switch.
 
 ### Architecture: three-phase iteration loop
 
-Each iteration runs three Claude phases on the same persistent sandbox:
+Each iteration runs three agent phases on the same persistent sandbox:
 
 ```
 for each iteration:
@@ -95,12 +104,15 @@ All phases are fail-closed:
 
 | Flag                   | Description                                                       |
 | ---------------------- | ----------------------------------------------------------------- |
+| --claude               | Run Claude (default)                                              |
+| --codex                | Run Codex                                                         |
+| --agent AGENT          | Select `claude` or `codex`                                        |
 | --new                  | Remove and recreate sandbox before running                        |
 | --rm                   | Remove the sandbox                                                |
 | --max-iterations N     | Maximum number of iterations to run (default: 1)                  |
 | --env KEY=VALUE        | Pass environment variable to sandbox (can be used multiple times) |
 | --env-file FILE        | Load environment variables from a file                            |
-| --include-local-config | Copy local Claude plugins, skills, and settings into sandbox      |
+| --include-local-config | Copy local agent plugins, skills, and settings into sandbox       |
 
 ### Examples
 
@@ -108,10 +120,12 @@ All phases are fail-closed:
 ralphish ~/project                           # Run one iteration on ~/project
 ralphish --max-iterations 5 .                # Run up to 5 iterations on current directory
 ralphish --new --max-iterations 3 .          # Fresh sandbox, up to 3 iterations
+ralphish --codex .                           # Run one iteration with Codex instead of Claude
+ralphish --agent codex --max-iterations 2 .  # Same, using the generic agent flag
 ralphish --rm .                              # Remove sandbox for current directory
 ralphish --env GITHUB_TOKEN=ghp_xxxx .       # Pass a secret into the sandbox
 ralphish --env-file ~/.ralphish-secrets .    # Load secrets from a file
-ralphish --include-local-config .            # Run with your local Claude plugins and skills
+ralphish --include-local-config .            # Run with your local agent plugins and skills
 ```
 
 ### progress.yaml format
