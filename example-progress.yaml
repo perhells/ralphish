@@ -46,6 +46,7 @@ tasks:
       Propagate it via context to all downstream calls and include it in responses.
     status: todo
     blocked_by: [2]
+    repo: null
     parent_id: null
     branch: null
     head_sha: null
@@ -58,6 +59,7 @@ tasks:
       with a configurable timeout, then close database and cache connections.
     status: todo
     blocked_by: [3]
+    repo: ../other-service
     parent_id: null
     branch: null
     head_sha: null

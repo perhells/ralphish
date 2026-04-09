@@ -141,6 +141,7 @@ tasks:
       Propagate it via context to all downstream calls and include it in responses.
     status: todo
     blocked_by: [2]
+    repo: ../api-service
 
 orchestration:
   last_sync_sha: def5678
@@ -156,20 +157,43 @@ orchestration:
 
 | Field            | Description                                                        |
 | ---------------- | ------------------------------------------------------------------ |
-| `id`             | Unique integer identifier                                          |
-| `title`          | Short name for the task                                            |
-| `description`    | Detailed description of what to implement                          |
-| `status`         | `todo`, `done`, `blocked`, or `skipped`                            |
-| `blocked_by`     | List of task IDs that must be completed before this task can start  |
-| `parent_id`      | If split from another task, the parent task's ID (null otherwise)  |
-| `branch`         | Feature branch name (null until work starts)                       |
-| `head_sha`       | Last known commit SHA on the feature branch (null until committed) |
-| `retry_count`    | Consecutive review rejections for current attempt (default: 0)     |
-| `last_rejection` | Summary of last rejection reason (null if none)                    |
+| `id`             | Unique integer identifier                                                       |
+| `title`          | Short name for the task                                                         |
+| `description`    | Detailed description of what to implement                                       |
+| `status`         | `todo`, `done`, `blocked`, or `skipped`                                         |
+| `blocked_by`     | List of task IDs that must be completed before this task can start               |
+| `repo`           | Path to the repo for this task (absolute or relative to progress.yaml; see below)|
+| `parent_id`      | If split from another task, the parent task's ID (null otherwise)               |
+| `branch`         | Feature branch name (null until work starts)                                    |
+| `head_sha`       | Last known commit SHA on the feature branch (null until committed)              |
+| `retry_count`    | Consecutive review rejections for current attempt (default: 0)                  |
+| `last_rejection` | Summary of last rejection reason (null if none)                                 |
 
 `next_id` tracks the next available ID for new tasks. `ralphish` picks the first `todo` task whose `blocked_by` dependencies are all `done`.
 
-New fields (`parent_id`, `branch`, `head_sha`, `retry_count`, `last_rejection`) are optional — existing `progress.yaml` files without them work fine (missing fields default to zero values).
+New fields (`repo`, `parent_id`, `branch`, `head_sha`, `retry_count`, `last_rejection`) are optional — existing `progress.yaml` files without them work fine (missing fields default to zero values).
+
+#### Repo-scoped sandboxes
+
+When a task has a `repo` field, `ralphish` mounts **only that repo** into the sandbox, limiting what the agent can see and modify. The path can be absolute or relative to the directory containing `progress.yaml`.
+
+```yaml
+tasks:
+  - id: 1
+    title: Add rate limiting
+    repo: ../api-service         # sandbox sees only api-service/
+    ...
+  - id: 2
+    title: Update shared types
+    repo: /home/user/shared-lib  # absolute path works too
+    ...
+  - id: 3
+    title: Fix tests
+    # no repo field — sandbox sees the progress.yaml directory
+    ...
+```
+
+Task selection happens on the host before creating the sandbox, so each iteration's sandbox is scoped to the correct repo. When the repo differs from the `progress.yaml` directory, `ralphish` syncs `progress.yaml` and `.ralphish/` state in and out of the mounted repo automatically.
 
 #### Orchestration section
 

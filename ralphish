@@ -77,36 +77,47 @@ if [ -z "$CC_TOKEN" ] && [ "$MODE" != "rm" ]; then
     exit 1
 fi
 
-WORKSPACE="$(cd "$WORKSPACE" && pwd)"
-BASENAME="$(basename "$WORKSPACE")"
-
-# Truncate sandbox name to avoid Unix socket path length limits
-# Docker uses: ~/.docker/sandboxes/vm/<name>/eth (max ~94 chars total)
-MAX_NAME_LEN=40
-if [ ${#BASENAME} -gt $MAX_NAME_LEN ]; then
-    HASH=$(echo -n "$BASENAME" | shasum | cut -c1-6)
-    BASENAME="${BASENAME:0:$((MAX_NAME_LEN - 7))}-$HASH"
-fi
-SANDBOX="claude-$BASENAME"
+CONFIG_DIR="$(cd "$WORKSPACE" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Compute a sandbox name from a directory path
+compute_sandbox_name() {
+    local dir="$1"
+    local bn
+    bn="$(basename "$dir")"
+    local max=40
+    if [ ${#bn} -gt $max ]; then
+        local hash
+        hash=$(echo -n "$bn" | shasum | cut -c1-6)
+        bn="${bn:0:$((max - 7))}-$hash"
+    fi
+    echo "claude-$bn"
+}
 
 case "$MODE" in
 rm)
-    sandbox --rm "$WORKSPACE"
+    # Remove sandbox for the config directory
+    sandbox --rm "$CONFIG_DIR"
+    # Also remove sandboxes for any repo-scoped tasks
+    if [ -f "$CONFIG_DIR/progress.yaml" ]; then
+        REPOS=$(python3 "$SCRIPT_DIR/select-task.py" "$CONFIG_DIR" --repos 2>/dev/null) || true
+        while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            repo_path="$(cd "$CONFIG_DIR" && cd "$repo" && pwd 2>/dev/null)" || continue
+            [ "$repo_path" = "$CONFIG_DIR" ] && continue
+            sandbox --rm "$repo_path" 2>/dev/null || true
+        done <<< "$REPOS"
+    fi
     ;;
 *)
-    # Separate init-only args (--new, --include-local-config) from phase args (--env)
-    # --new would destroy and recreate the sandbox on every call, breaking inter-phase state
+    # Build phase args (passed to every sandbox call)
     PHASE_ARGS=()
     for env_var in "${CUSTOM_ENV[@]}"; do PHASE_ARGS+=(--env "$env_var"); done
     [ -n "$ENV_FILE" ] && PHASE_ARGS+=(--env-file "$ENV_FILE")
 
-    INIT_ARGS=("${PHASE_ARGS[@]}")
-    [ "$NEW" = true ] && INIT_ARGS+=(--new)
-    [ "$INCLUDE_LOCAL_CONFIG" = true ] && INIT_ARGS+=(--include-local-config)
-
-    # Create/resume sandbox (bash exits immediately; 2>/dev/null suppresses TTY warnings)
-    sandbox "${INIT_ARGS[@]}" --bash "$WORKSPACE" <<< 'exit 0' 2>/dev/null || true
+    # Extra args for sandbox init (not repeated per phase)
+    SANDBOX_INIT_EXTRA=()
+    [ "$INCLUDE_LOCAL_CONFIG" = true ] && SANDBOX_INIT_EXTRA+=(--include-local-config)
 
     # ─── Phase prompts ──────────────────────────────────────────────────
 
@@ -255,22 +266,34 @@ You MUST:
 
     TMPFILE=$(mktemp)
     printf '\033[?25l'  # hide cursor
+
+    # WORK_DIR and SANDBOX are set per-iteration; initialise for cleanup handler
+    WORK_DIR=""
+    SANDBOX=""
+
     cleanup() {
         trap - INT TERM
         printf '\033[?25h'  # restore cursor
         echo ""
-        echo "Interrupted — aborting sandbox: $SANDBOX"
+        if [ -n "$SANDBOX" ]; then
+            echo "Interrupted — aborting sandbox: $SANDBOX"
+            docker sandbox stop "$SANDBOX" &>/dev/null &
+        fi
         pkill -P $$ 2>/dev/null || true
-        docker sandbox stop "$SANDBOX" &>/dev/null &
+        # Clean synced state from work repo if it differs from config dir
+        if [ -n "$WORK_DIR" ] && [ "$WORK_DIR" != "$CONFIG_DIR" ]; then
+            rm -f "$WORK_DIR/progress.yaml" 2>/dev/null
+            rm -rf "$WORK_DIR/.ralphish" 2>/dev/null
+        fi
         rm -f "$TMPFILE"
         exit 130
     }
     trap cleanup INT TERM
     trap 'printf "\033[?25h"; rm -f "$TMPFILE"' EXIT
 
-    # Run a bash command inside the sandbox (for utility operations, no Claude)
+    # Run a bash command inside the current sandbox
     sandbox_exec() {
-        docker sandbox exec "$SANDBOX" bash -c "cd '$WORKSPACE' && $1"
+        docker sandbox exec "$SANDBOX" bash -c "cd '$WORK_DIR' && $1"
     }
 
     # Run a Claude phase in the sandbox and stream output through the formatter
@@ -278,11 +301,11 @@ You MUST:
         local phase="$1"
         local prompt="$2"
 
-        sandbox "${PHASE_ARGS[@]}" --prompt "$prompt" "$WORKSPACE" | \
+        sandbox "${PHASE_ARGS[@]}" --prompt "$prompt" "$WORK_DIR" | \
             tee "$TMPFILE" | \
             python3 -u "$SCRIPT_DIR/stream-claude-json.py" \
                 --iteration "$i" --max "$MAX_ITERATIONS" \
-                --sandbox "$SANDBOX" --workspace "$WORKSPACE" \
+                --sandbox "$SANDBOX" --workspace "$WORK_DIR" \
                 --phase "$phase" &
         local pid=$!
         local rc=0
@@ -290,10 +313,10 @@ You MUST:
         return $rc
     }
 
-    # Fetch upstream and update the local base branch without switching away from current branch
+    # Fetch upstream and update the local base branch
     sync_phase() {
         docker sandbox exec "$SANDBOX" bash -c '
-            cd "'"$WORKSPACE"'"
+            cd "'"$WORK_DIR"'"
             git fetch origin 2>/dev/null || true
             DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed "s|refs/remotes/origin/||")
             [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
@@ -306,13 +329,86 @@ You MUST:
         ' 2>/dev/null || true
     }
 
+    # Copy progress.yaml and .ralphish/ from CONFIG_DIR into WORK_DIR
+    sync_state_in() {
+        [ "$WORK_DIR" = "$CONFIG_DIR" ] && return
+        cp "$CONFIG_DIR/progress.yaml" "$WORK_DIR/progress.yaml"
+        rm -rf "$WORK_DIR/.ralphish"
+        if [ -d "$CONFIG_DIR/.ralphish" ]; then
+            cp -R "$CONFIG_DIR/.ralphish" "$WORK_DIR/.ralphish"
+        else
+            mkdir -p "$WORK_DIR/.ralphish"
+        fi
+    }
+
+    # Copy progress.yaml and .ralphish/ from WORK_DIR back to CONFIG_DIR, then clean up
+    sync_state_out() {
+        [ "$WORK_DIR" = "$CONFIG_DIR" ] && return
+        local tmpdir
+        tmpdir=$(mktemp -d "${CONFIG_DIR}/.ralphish-sync.XXXXXX")
+        cp "$WORK_DIR/progress.yaml" "$tmpdir/progress.yaml"
+        cp -R "$WORK_DIR/.ralphish" "$tmpdir/.ralphish"
+        # Atomic swap into CONFIG_DIR
+        mv -f "$tmpdir/progress.yaml" "$CONFIG_DIR/progress.yaml"
+        rm -rf "$CONFIG_DIR/.ralphish"
+        mv "$tmpdir/.ralphish" "$CONFIG_DIR/.ralphish"
+        rm -rf "$tmpdir"
+        # Clean synced files from work repo
+        rm -f "$WORK_DIR/progress.yaml"
+        rm -rf "$WORK_DIR/.ralphish"
+    }
+
     # ─── Clean transient state ───────────────────────────────────────────
 
-    sandbox_exec "rm -rf .ralphish && mkdir -p .ralphish" 2>/dev/null
+    rm -rf "$CONFIG_DIR/.ralphish"
+    mkdir -p "$CONFIG_DIR/.ralphish"
+
+    # Track which sandboxes have been initialised this invocation
+    INITIALIZED_SANDBOXES=""
 
     # ─── Main loop ───────────────────────────────────────────────────────
 
     for ((i=1; i<=MAX_ITERATIONS; i++)); do
+
+        # ─── Task selection (host-side) ──────────────────────────────
+        TASK_INFO=$(python3 "$SCRIPT_DIR/select-task.py" "$CONFIG_DIR")
+
+        if echo "$TASK_INFO" | grep -q "^all_done=true"; then
+            echo "All tasks already complete."
+            exit 0
+        fi
+        if echo "$TASK_INFO" | grep -q "^no_task=true"; then
+            echo "No eligible tasks (all blocked or none remaining)."
+            exit 0
+        fi
+
+        TASK_ID=$(echo "$TASK_INFO" | grep "^task_id=" | cut -d= -f2-)
+        TASK_REPO=$(echo "$TASK_INFO" | grep "^repo=" | cut -d= -f2-)
+
+        # Resolve work directory from task's repo field
+        if [ -n "$TASK_REPO" ]; then
+            WORK_DIR="$(cd "$CONFIG_DIR" && cd "$TASK_REPO" && pwd)" || {
+                echo "Error: cannot resolve repo path '$TASK_REPO' from $CONFIG_DIR"
+                exit 1
+            }
+        else
+            WORK_DIR="$CONFIG_DIR"
+        fi
+        SANDBOX=$(compute_sandbox_name "$WORK_DIR")
+
+        echo "Task $TASK_ID → $([ -n "$TASK_REPO" ] && echo "$WORK_DIR" || echo "(local)")"
+
+        # ─── Sandbox init ────────────────────────────────────────────
+        if ! echo "$INITIALIZED_SANDBOXES" | grep -qF ":${SANDBOX}:"; then
+            INIT_ARGS=("${PHASE_ARGS[@]}" "${SANDBOX_INIT_EXTRA[@]}")
+            [ "$NEW" = true ] && INIT_ARGS+=(--new)
+            sandbox "${INIT_ARGS[@]}" --bash "$WORK_DIR" <<< 'exit 0' 2>/dev/null || true
+            INITIALIZED_SANDBOXES="${INITIALIZED_SANDBOXES}:${SANDBOX}:"
+        fi
+
+        # ─── State sync in ──────────────────────────────────────────
+        sync_state_in
+        sandbox_exec "mkdir -p .ralphish" 2>/dev/null
 
         # Phase 0: Sync — fetch upstream, update base branch
         sync_phase
@@ -320,10 +416,12 @@ You MUST:
         # Phase 1: Worker — implement one task, write summary.yaml
         worker_prompt="${WORKER_PROMPT//\{\{ITERATION\}\}/$i}"
         if ! run_phase "worker" "$worker_prompt"; then
+            sync_state_out
             echo "Worker phase failed"
             exit 1
         fi
         if ! sandbox_exec "test -f .ralphish/summary.yaml" 2>/dev/null; then
+            sync_state_out
             echo "Worker phase did not produce .ralphish/summary.yaml"
             exit 1
         fi
@@ -340,6 +438,7 @@ You MUST:
             [ "$attempt" -eq 1 ] && echo "Reviewer phase failed, retrying..."
         done
         if [ "$reviewer_ok" = false ]; then
+            sync_state_out
             echo "Reviewer phase failed after retry"
             exit 1
         fi
@@ -348,6 +447,9 @@ You MUST:
         orch_prompt="${ORCHESTRATOR_PROMPT//\{\{ITERATION\}\}/$i}"
         orch_rc=0
         run_phase "orchestrator" "$orch_prompt" || orch_rc=$?
+
+        # ─── State sync out ──────────────────────────────────────────
+        sync_state_out
 
         # Check signals from orchestrator output
         if grep -q '<promise>COMPLETE</promise>' "$TMPFILE"; then
