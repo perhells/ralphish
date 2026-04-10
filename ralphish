@@ -221,6 +221,7 @@ Current iteration: {{ITERATION}}
 
 1. Check if `.ralphish/context.yaml` exists. If it does, read it for:
    - `assigned_task_id`: work on this specific task
+   - `implementation_plan`: follow this plan as your starting guide for the task
    - `feedback` and `reviewer_remarks`: address this feedback from the previous attempt
    - `prior_attempt_branch` and `prior_attempt_head_sha`: your previous work to build on
 
@@ -238,7 +239,13 @@ Current iteration: {{ITERATION}}
 
 5. After committing, record the feature branch HEAD SHA — this is your `head_sha`.
 
-6. Write `.ralphish/summary.yaml` with this exact structure:
+6. **Self-review before finishing**: Run `git diff <base_sha>..<head_sha>` yourself and verify:
+   - Every requirement from the task description is addressed
+   - No unintended changes, debug prints, or leftover TODO comments
+   - Tests pass (run the project test suite if one exists)
+   If you spot issues, fix them and amend/add commits before proceeding.
+
+7. Write `.ralphish/summary.yaml` with this exact structure:
    ```yaml
    task_id: <integer>
    task_title: "<string>"
@@ -256,6 +263,7 @@ You MUST:
 - Only work on a single task per iteration
 - Always use a feature branch for development
 - Commit one logical change at a time to the feature branch
+- Self-review your diff before writing summary.yaml
 - Write .ralphish/summary.yaml before finishing
 - NOT update progress.yaml — the orchestrator handles that'
 
@@ -270,18 +278,23 @@ You MUST:
 3. Examine the exact diff using: `git diff <base_sha>..<head_sha>`
    Use the SHAs from summary.yaml — do NOT diff branch names, as branches may include unrelated commits.
 
-4. Review the implementation for:
+4. Run the project test suite (if one exists) on the feature branch at `head_sha`:
+   - Checkout `head_sha`, run tests, record pass/fail counts
+   - If tests fail, this is strong evidence for `request_changes`
+
+5. Review the implementation for:
    - **Correctness**: Does it match the task requirements?
    - **Quality**: Code style, error handling, edge cases
-   - **Test coverage**: Are there adequate tests?
+   - **Test coverage**: Are there adequate tests? Do they pass?
    - **Task alignment**: Does the work stay within scope?
 
-5. Write `.ralphish/review.yaml` with this exact structure:
+6. Write `.ralphish/review.yaml` with this exact structure:
    ```yaml
    task_id: <integer>
    base_sha: "<40-char sha>"
    head_sha: "<40-char sha>"
    verdict: approve  # or: request_changes
+   test_results: "<pass/fail summary, or 'no test suite found'>"
    remarks:
      - "<specific remark — reference files and line numbers>"
    ```
@@ -336,15 +349,20 @@ Current iteration: {{ITERATION}}
    ```yaml
    assigned_task_id: <next eligible task ID, or current task ID if retrying>
    feedback: "<feedback for the worker>"
+   implementation_plan:
+     - "<step 1: brief description of the first thing the worker should do>"
+     - "<step 2: next action>"
+     - "<step 3: final action>"
    reviewer_remarks:
      - "<remark from review.yaml>"
    prior_attempt_branch: "<branch from summary.yaml>"
    prior_attempt_head_sha: "<head_sha from summary.yaml>"
    ```
+   The `implementation_plan` should be a concise 2-4 step plan based on your understanding of the task requirements, the codebase, and any feedback from the current iteration. This helps the worker succeed on the first attempt.
 
 6. Determine the next action:
    - If NO remaining `todo` tasks (all are done/blocked/skipped): output `<promise>COMPLETE</promise>`
-   - If external action is needed before next task (PR merge, deployment, manual approval, or you significantly restructured the plan): output `<promise>PAUSE</promise>`
+   - If external action is needed before next task (PR merge, deployment, manual approval, or you significantly restructured the plan): output `<promise>PAUSE</promise>`. NOTE: switching to a different repo is NOT external action — the orchestrator handles repo switches automatically.
    - Otherwise: output nothing (the loop continues to the next iteration)
 
 You MUST:
