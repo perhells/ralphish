@@ -8,6 +8,11 @@ tasks:
       Return 429 with Retry-After header when exceeded.
     status: done
     blocked_by: []
+    parent_id: null
+    branch: feature/rate-limiting
+    head_sha: null
+    retry_count: 0
+    last_rejection: null
   - id: 2
     title: Add structured JSON logging
     description: |
@@ -16,6 +21,11 @@ tasks:
       Log to stdout in JSON format.
     status: done
     blocked_by: []
+    parent_id: null
+    branch: feature/structured-logging
+    head_sha: null
+    retry_count: 0
+    last_rejection: null
   - id: 3
     title: Add health check endpoint
     description: |
@@ -24,6 +34,11 @@ tasks:
       Used by container orchestrator liveness/readiness probes.
     status: done
     blocked_by: []
+    parent_id: null
+    branch: feature/healthz
+    head_sha: null
+    retry_count: 0
+    last_rejection: null
   - id: 4
     title: Add request ID propagation
     description: |
@@ -31,6 +46,12 @@ tasks:
       Propagate it via context to all downstream calls and include it in responses.
     status: todo
     blocked_by: [2]
+    repo: null
+    parent_id: null
+    branch: null
+    head_sha: null
+    retry_count: 0
+    last_rejection: null
   - id: 5
     title: Add graceful shutdown
     description: |
@@ -38,3 +59,13 @@ tasks:
       with a configurable timeout, then close database and cache connections.
     status: todo
     blocked_by: [3]
+    repo: ../other-service
+    parent_id: null
+    branch: null
+    head_sha: null
+    retry_count: 0
+    last_rejection: null
+
+orchestration:
+  last_sync_sha: null
+  history: []

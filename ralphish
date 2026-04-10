@@ -2,18 +2,84 @@
 set -e
 set -o pipefail
 
-IMAGE_NAME="claude-ralph"
-
-MODE="claude"
+MODE="run"
+AGENT="claude"
 WORKSPACE=""
 NEW=false
 MAX_ITERATIONS=1
+INCLUDE_LOCAL_CONFIG=false
+CUSTOM_ENV=()
+ENV_FILE=""
+
+usage() {
+    cat <<'EOF'
+Usage: ralphish [OPTIONS] [WORKSPACE]
+
+Options:
+      --claude                     Run Claude (default)
+      --codex                      Run Codex
+      --agent AGENT                Select claude or codex
+      --new                        Remove and recreate sandbox before running
+      --rm                         Remove the sandbox for this workspace
+      --max-iterations N           Maximum iterations to run (default: 1)
+      --env KEY=VALUE              Pass environment variable to sandbox (repeatable)
+      --env-file FILE              Load environment variables from a file
+      --include-local-config       Sync local agent config into sandbox
+      --help                       Show this help
+EOF
+}
+
+has_forwarded_env_key() {
+    local key="$1"
+    local env_var
+    local line
+    local entry_key
+
+    for env_var in "${CUSTOM_ENV[@]}"; do
+        if [ "${env_var%%=*}" = "$key" ]; then
+            return 0
+        fi
+    done
+
+    if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [ -z "${line//[[:space:]]/}" ] && continue
+            entry_key="${line%%=*}"
+            if [ "$entry_key" = "$key" ]; then
+                return 0
+            fi
+        done < "$ENV_FILE"
+    fi
+
+    return 1
+}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
     --help)
         usage
         exit 0
+        ;;
+    --claude)
+        AGENT="claude"
+        shift
+        ;;
+    --codex)
+        AGENT="codex"
+        shift
+        ;;
+    --agent=*)
+        AGENT="${1#--agent=}"
+        shift
+        ;;
+    --agent)
+        if [ -z "$2" ]; then
+            echo "Error: --agent requires a value"
+            exit 1
+        fi
+        AGENT="$2"
+        shift 2
         ;;
     --new)
         NEW=true
@@ -32,6 +98,34 @@ while [[ $# -gt 0 ]]; do
         MAX_ITERATIONS="$1"
         shift
         ;;
+    --env=*)
+        CUSTOM_ENV+=("${1#--env=}")
+        shift
+        ;;
+    --env)
+        if [ -z "$2" ]; then
+            echo "Error: --env requires a KEY=VALUE argument"
+            exit 1
+        fi
+        CUSTOM_ENV+=("$2")
+        shift 2
+        ;;
+    --env-file=*)
+        ENV_FILE="${1#--env-file=}"
+        shift
+        ;;
+    --env-file)
+        if [ -z "$2" ]; then
+            echo "Error: --env-file requires a file path argument"
+            exit 1
+        fi
+        ENV_FILE="$2"
+        shift 2
+        ;;
+    --include-local-config)
+        INCLUDE_LOCAL_CONFIG=true
+        shift
+        ;;
     *)
         WORKSPACE="$1"
         shift
@@ -43,92 +137,447 @@ if [ -z "$WORKSPACE" ]; then
     WORKSPACE="."
 fi
 
-if [ -z "$CC_TOKEN" ] && [ "$MODE" != "rm" ]; then
-    echo "Error: CC_TOKEN environment variable is not set"
+case "$AGENT" in
+claude|codex) ;;
+*)
+    echo "Error: unsupported agent '$AGENT' (expected claude or codex)"
+    usage
+    exit 1
+    ;;
+esac
+
+if [ -n "$ENV_FILE" ] && [ ! -f "$ENV_FILE" ]; then
+    echo "Error: env file not found: $ENV_FILE"
     exit 1
 fi
 
-WORKSPACE="$(cd "$WORKSPACE" && pwd)"
-BASENAME="$(basename "$WORKSPACE")"
-
-# Truncate sandbox name to avoid Unix socket path length limits
-# Docker uses: ~/.docker/sandboxes/vm/<name>/eth (max ~94 chars total)
-MAX_NAME_LEN=40
-if [ ${#BASENAME} -gt $MAX_NAME_LEN ]; then
-    HASH=$(echo -n "$BASENAME" | shasum | cut -c1-6)
-    BASENAME="${BASENAME:0:$((MAX_NAME_LEN - 7))}-$HASH"
+if [ "$MODE" != "rm" ]; then
+    case "$AGENT" in
+    claude)
+        if [ -z "$CC_TOKEN" ]; then
+            echo "Error: CC_TOKEN environment variable is not set"
+            exit 1
+        fi
+        ;;
+    codex)
+        if [ -z "$OPENAI_API_KEY" ] && ! has_forwarded_env_key "OPENAI_API_KEY" && [ ! -f "$HOME/.codex/auth.json" ]; then
+            echo "Error: Codex auth not found"
+            echo "Run 'codex login' locally, set OPENAI_API_KEY in your shell, or pass it with --env/--env-file"
+            exit 1
+        fi
+        ;;
+    esac
 fi
-SANDBOX="claude-$BASENAME"
+
+CONFIG_DIR="$(cd "$WORKSPACE" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Compute a sandbox name from a directory path and selected agent
+compute_sandbox_name() {
+    local dir="$1"
+    local bn
+    bn="$(basename "$dir")"
+    local max=40
+    if [ ${#bn} -gt $max ]; then
+        local hash
+        hash=$(echo -n "$bn" | shasum | cut -c1-6)
+        bn="${bn:0:$((max - 7))}-$hash"
+    fi
+    echo "$AGENT-$bn"
+}
 
 case "$MODE" in
 rm)
-    echo "Removing sandbox: $SANDBOX"
-    docker sandbox rm "$SANDBOX" 2>&1 || echo "Failed to remove sandbox (may not exist)"
+    # Remove sandbox for the config directory
+    sandbox --agent "$AGENT" --rm "$CONFIG_DIR"
+    # Also remove sandboxes for any repo-scoped tasks
+    if [ -f "$CONFIG_DIR/progress.yaml" ]; then
+        REPOS=$(python3 "$SCRIPT_DIR/select-task.py" "$CONFIG_DIR" --repos 2>/dev/null) || true
+        while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            repo_path="$(cd "$CONFIG_DIR" && cd "$repo" && pwd 2>/dev/null)" || continue
+            [ "$repo_path" = "$CONFIG_DIR" ] && continue
+            sandbox --agent "$AGENT" --rm "$repo_path" 2>/dev/null || true
+        done <<< "$REPOS"
+    fi
     ;;
 *)
-    if [ "$NEW" = true ]; then
-        echo "Removing sandbox: $SANDBOX"
-        docker sandbox rm "$SANDBOX" 2>/dev/null || true
-    fi
+    # Build phase args (passed to every sandbox call)
+    PHASE_ARGS=()
+    for env_var in "${CUSTOM_ENV[@]}"; do PHASE_ARGS+=(--env "$env_var"); done
+    [ -n "$ENV_FILE" ] && PHASE_ARGS+=(--env-file "$ENV_FILE")
 
-    CREATE_OUTPUT=$(docker sandbox create -q --name "$SANDBOX" --template "$IMAGE_NAME" claude "$WORKSPACE" 2>&1 || true)
-    if echo "$CREATE_OUTPUT" | grep -q "already exists"; then
-        echo "Resuming sandbox: $SANDBOX"
-    elif [ -z "$CREATE_OUTPUT" ]; then
-        echo "Created sandbox: $SANDBOX"
-    else
-        echo "$CREATE_OUTPUT"
-    fi
+    # Extra args for sandbox init (not repeated per phase)
+    SANDBOX_INIT_EXTRA=()
+    [ "$INCLUDE_LOCAL_CONFIG" = true ] && SANDBOX_INIT_EXTRA+=(--include-local-config)
 
-    CLAUDE_PROMPT='
-        1. Find the highest priority task from progress.yaml
-        2. Implement the task
-        3. Run all tests/checks for the project and fix any problems
-        4. Append your progress to progress.yaml
-        5. If all tasks are complete, output <promise>COMPLETE</promise>
+    # ─── Phase prompts ──────────────────────────────────────────────────
 
-        You MUST:
-        - Only work on a single task
-        - Always use a feature branch for development, create it if the branch does not exist
-        - A feature branch can be based on the projects default branch or another feature branch
-        - Commit one change at a time to the feature branch
-    '
+    WORKER_PROMPT='You are the WORKER phase of a three-phase development loop (worker → reviewer → orchestrator).
+
+Current iteration: {{ITERATION}}
+
+## Instructions
+
+1. Check if `.ralphish/context.yaml` exists. If it does, read it for:
+   - `assigned_task_id`: work on this specific task
+   - `implementation_plan`: follow this plan as your starting guide for the task
+   - `feedback` and `reviewer_remarks`: address this feedback from the previous attempt
+   - `prior_attempt_branch` and `prior_attempt_head_sha`: your previous work to build on
+
+2. If no context.yaml exists or it has no assigned_task_id, pick the first eligible task from `progress.yaml`:
+   - Status is `todo`
+   - All `blocked_by` IDs have status `done`
+
+3. Before creating/switching to a feature branch, record the current HEAD SHA of the base branch — this is your `base_sha`.
+
+4. Implement the task:
+   - Create or checkout a feature branch (can be based on default branch or another feature branch)
+   - Implement the changes
+   - Run all tests/checks and fix any problems
+   - Commit your work (one logical change per commit)
+
+5. After committing, record the feature branch HEAD SHA — this is your `head_sha`.
+
+6. **Self-review before finishing**: Run `git diff <base_sha>..<head_sha>` yourself and verify:
+   - Every requirement from the task description is addressed
+   - No unintended changes, debug prints, or leftover TODO comments
+   - Tests pass (run the project test suite if one exists)
+   If you spot issues, fix them and amend/add commits before proceeding.
+
+7. Write `.ralphish/summary.yaml` with this exact structure:
+   ```yaml
+   task_id: <integer>
+   task_title: "<string>"
+   base_sha: "<40-char sha>"
+   head_sha: "<40-char sha>"
+   branch: "<branch-name>"
+   what_was_done: "<description of implementation>"
+   findings:
+     - "<finding 1>"
+   suggestions:
+     - "<suggestion 1>"
+   ```
+
+You MUST:
+- Only work on a single task per iteration
+- Always use a feature branch for development
+- Commit one logical change at a time to the feature branch
+- Self-review your diff before writing summary.yaml
+- Write .ralphish/summary.yaml before finishing
+- NOT update progress.yaml — the orchestrator handles that'
+
+    REVIEWER_PROMPT='You are the REVIEWER phase of a three-phase development loop (worker → reviewer → orchestrator).
+
+## Instructions
+
+1. Read `.ralphish/summary.yaml` to get the `task_id`, `base_sha`, `head_sha`, and `branch`.
+
+2. Read `progress.yaml` to understand the task requirements (find the task matching `task_id`).
+
+3. Examine the exact diff using: `git diff <base_sha>..<head_sha>`
+   Use the SHAs from summary.yaml — do NOT diff branch names, as branches may include unrelated commits.
+
+4. Run the project test suite (if one exists) on the feature branch at `head_sha`:
+   - Checkout `head_sha`, run tests, record pass/fail counts
+   - If tests fail, this is strong evidence for `request_changes`
+
+5. Review the implementation for:
+   - **Correctness**: Does it match the task requirements?
+   - **Quality**: Code style, error handling, edge cases
+   - **Test coverage**: Are there adequate tests? Do they pass?
+   - **Task alignment**: Does the work stay within scope?
+
+6. Write `.ralphish/review.yaml` with this exact structure:
+   ```yaml
+   task_id: <integer>
+   base_sha: "<40-char sha>"
+   head_sha: "<40-char sha>"
+   verdict: approve  # or: request_changes
+   test_results: "<pass/fail summary, or 'no test suite found'>"
+   remarks:
+     - "<specific remark — reference files and line numbers>"
+   ```
+
+You MUST:
+- NOT modify any code, configuration, or project files
+- NOT update progress.yaml
+- Use the exact base_sha..head_sha range from summary.yaml for your diff
+- Be specific in remarks — reference files and line numbers
+- Only use `approve` or `request_changes` as the verdict'
+
+    ORCHESTRATOR_PROMPT='You are the ORCHESTRATOR phase of a three-phase development loop (worker → reviewer → orchestrator).
+
+Current iteration: {{ITERATION}}
+
+## Instructions
+
+1. Read `.ralphish/summary.yaml`, `.ralphish/review.yaml`, and `progress.yaml`.
+
+2. Validate review identity:
+   - `review.yaml.task_id` must match `summary.yaml.task_id`
+   - `review.yaml.base_sha` must match `summary.yaml.base_sha`
+   - `review.yaml.head_sha` must match `summary.yaml.head_sha`
+   If they do not match, treat this as a review failure and skip to writing context.yaml with an error note.
+
+3. Based on the verdict in review.yaml:
+
+   **If `approve`:**
+   - Set the task status to `done` in progress.yaml
+   - Record `branch` and `head_sha` on the task
+   - Set `retry_count` to 0 on the task
+
+   **If `request_changes`:**
+   - Increment `retry_count` on the task (add the field if missing, starting from 0)
+   - Set `last_rejection` to a short summary of the rejection reason
+   - If `retry_count >= 3`, you MUST escalate — do NOT retry again:
+     - Preferred: split into smaller subtasks (new tasks with `parent_id` = original task ID, IDs from `next_id`, increment `next_id` after each)
+     - Fallback: set task status to `blocked` with explanation in `last_rejection`
+     - Last resort: set task status to `skipped` with explanation in `last_rejection`
+   - Otherwise: keep task as `todo`
+
+4. Ensure `progress.yaml` has an `orchestration` section (create it if missing). Append to `orchestration.history`:
+   ```yaml
+   - iteration: {{ITERATION}}
+     task_id: <id>
+     verdict: <approve|request_changes>
+     summary: "<what happened>"
+     decision: "<what you decided: done|retry|split|blocked|skipped>"
+   ```
+
+5. Write `.ralphish/context.yaml` for the next worker iteration:
+   ```yaml
+   assigned_task_id: <next eligible task ID, or current task ID if retrying>
+   feedback: "<feedback for the worker>"
+   implementation_plan:
+     - "<step 1: brief description of the first thing the worker should do>"
+     - "<step 2: next action>"
+     - "<step 3: final action>"
+   reviewer_remarks:
+     - "<remark from review.yaml>"
+   prior_attempt_branch: "<branch from summary.yaml>"
+   prior_attempt_head_sha: "<head_sha from summary.yaml>"
+   ```
+   The `implementation_plan` should be a concise 2-4 step plan based on your understanding of the task requirements, the codebase, and any feedback from the current iteration. This helps the worker succeed on the first attempt.
+
+6. Determine the next action:
+   - If NO remaining `todo` tasks (all are done/blocked/skipped): output `<promise>COMPLETE</promise>`
+   - If external action is needed before next task (PR merge, deployment, manual approval, or you significantly restructured the plan): output `<promise>PAUSE</promise>`. NOTE: switching to a different repo is NOT external action — the orchestrator handles repo switches automatically.
+   - Otherwise: output nothing (the loop continues to the next iteration)
+
+You MUST:
+- Only modify `progress.yaml` and files in `.ralphish/`
+- NOT modify any code, source files, or project configuration
+- Increment `next_id` when creating new subtasks
+- Keep `orchestration.history` as an append-only log
+- Use valid task statuses: `todo`, `done`, `blocked`, `skipped`'
+
+    # ─── Helper functions ────────────────────────────────────────────────
 
     TMPFILE=$(mktemp)
     printf '\033[?25l'  # hide cursor
+
+    # WORK_DIR and SANDBOX are set per-iteration; initialise for cleanup handler
+    WORK_DIR=""
+    SANDBOX=""
+
     cleanup() {
         trap - INT TERM
         printf '\033[?25h'  # restore cursor
         echo ""
-        echo "Interrupted — aborting sandbox: $SANDBOX"
+        if [ -n "$SANDBOX" ]; then
+            echo "Interrupted — aborting sandbox: $SANDBOX"
+            docker sandbox stop "$SANDBOX" &>/dev/null &
+        fi
         pkill -P $$ 2>/dev/null || true
-        docker sandbox stop "$SANDBOX" &>/dev/null &
+        # Clean synced state from work repo if it differs from config dir
+        if [ -n "$WORK_DIR" ] && [ "$WORK_DIR" != "$CONFIG_DIR" ]; then
+            rm -f "$WORK_DIR/progress.yaml" 2>/dev/null
+            rm -rf "$WORK_DIR/.ralphish" 2>/dev/null
+        fi
         rm -f "$TMPFILE"
         exit 130
     }
     trap cleanup INT TERM
     trap 'printf "\033[?25h"; rm -f "$TMPFILE"' EXIT
-    for ((i=1; i<=MAX_ITERATIONS; i++)); do
-        docker sandbox exec -t "$SANDBOX" bash -c "
-            source ~/.claude/setup.sh &&
-            export CLAUDE_CODE_OAUTH_TOKEN='$CC_TOKEN' &&
-            cd '$WORKSPACE' &&
-            claude --dangerously-skip-permissions -p --output-format stream-json --verbose '$CLAUDE_PROMPT' 2>&1
-        " | tee "$TMPFILE" | python3 -u "$(dirname "$0")/stream-claude-json.py" --iteration "$i" --max "$MAX_ITERATIONS" --sandbox "$SANDBOX" --workspace "$WORKSPACE" &
-        pid=$!
 
-        rc=0
+    # Run a bash command inside the current sandbox
+    sandbox_exec() {
+        docker sandbox exec "$SANDBOX" bash -c "cd '$WORK_DIR' && $1"
+    }
+
+    # Run an agent phase in the sandbox and stream output through the formatter
+    run_phase() {
+        local phase="$1"
+        local prompt="$2"
+
+        sandbox --agent "$AGENT" "${PHASE_ARGS[@]}" --prompt "$prompt" "$WORK_DIR" | \
+            tee "$TMPFILE" | \
+            python3 -u "$SCRIPT_DIR/stream-claude-json.py" \
+                --agent "$AGENT" \
+                --iteration "$i" --max "$MAX_ITERATIONS" \
+                --sandbox "$SANDBOX" --workspace "$WORK_DIR" \
+                --phase "$phase" &
+        local pid=$!
+        local rc=0
         wait "$pid" || rc=$?
-        if [ $rc -ne 0 ] && ! grep -q '<promise>COMPLETE</promise>' "$TMPFILE"; then
-            echo "Sandbox exec failed (exit code $rc)"
-            exit $rc
+        return $rc
+    }
+
+    # Fetch upstream and update the local base branch
+    sync_phase() {
+        docker sandbox exec "$SANDBOX" bash -c '
+            cd "'"$WORK_DIR"'"
+            git fetch origin 2>/dev/null || true
+            DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed "s|refs/remotes/origin/||")
+            [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+            CURRENT=$(git branch --show-current 2>/dev/null)
+            if [ "$CURRENT" = "$DEFAULT_BRANCH" ]; then
+                git pull origin "$DEFAULT_BRANCH" 2>/dev/null || true
+            else
+                git fetch origin "$DEFAULT_BRANCH":"$DEFAULT_BRANCH" 2>/dev/null || true
+            fi
+        ' 2>/dev/null || true
+    }
+
+    # Copy progress.yaml and .ralphish/ from CONFIG_DIR into WORK_DIR
+    sync_state_in() {
+        [ "$WORK_DIR" = "$CONFIG_DIR" ] && return
+        cp "$CONFIG_DIR/progress.yaml" "$WORK_DIR/progress.yaml"
+        rm -rf "$WORK_DIR/.ralphish"
+        if [ -d "$CONFIG_DIR/.ralphish" ]; then
+            cp -R "$CONFIG_DIR/.ralphish" "$WORK_DIR/.ralphish"
+        else
+            mkdir -p "$WORK_DIR/.ralphish"
+        fi
+    }
+
+    # Copy progress.yaml and .ralphish/ from WORK_DIR back to CONFIG_DIR, then clean up
+    sync_state_out() {
+        [ "$WORK_DIR" = "$CONFIG_DIR" ] && return
+        local tmpdir
+        tmpdir=$(mktemp -d "${CONFIG_DIR}/.ralphish-sync.XXXXXX")
+        cp "$WORK_DIR/progress.yaml" "$tmpdir/progress.yaml"
+        cp -R "$WORK_DIR/.ralphish" "$tmpdir/.ralphish"
+        # Atomic swap into CONFIG_DIR
+        mv -f "$tmpdir/progress.yaml" "$CONFIG_DIR/progress.yaml"
+        rm -rf "$CONFIG_DIR/.ralphish"
+        mv "$tmpdir/.ralphish" "$CONFIG_DIR/.ralphish"
+        rm -rf "$tmpdir"
+        # Clean synced files from work repo
+        rm -f "$WORK_DIR/progress.yaml"
+        rm -rf "$WORK_DIR/.ralphish"
+    }
+
+    # ─── Clean transient state ───────────────────────────────────────────
+
+    rm -rf "$CONFIG_DIR/.ralphish"
+    mkdir -p "$CONFIG_DIR/.ralphish"
+
+    # Track which sandboxes have been initialised this invocation
+    INITIALIZED_SANDBOXES=""
+
+    # ─── Main loop ───────────────────────────────────────────────────────
+
+    for ((i=1; i<=MAX_ITERATIONS; i++)); do
+
+        # ─── Task selection (host-side) ──────────────────────────────
+        TASK_INFO=$(python3 "$SCRIPT_DIR/select-task.py" "$CONFIG_DIR")
+
+        if echo "$TASK_INFO" | grep -q "^all_done=true"; then
+            echo "All tasks already complete."
+            exit 0
+        fi
+        if echo "$TASK_INFO" | grep -q "^no_task=true"; then
+            echo "No eligible tasks (all blocked or none remaining)."
+            exit 0
         fi
 
-      if grep -q '<promise>COMPLETE</promise>' "$TMPFILE"; then
-        echo "PRD complete after $i iterations."
-        exit 0
-      fi
+        TASK_ID=$(echo "$TASK_INFO" | grep "^task_id=" | cut -d= -f2-)
+        TASK_REPO=$(echo "$TASK_INFO" | grep "^repo=" | cut -d= -f2-)
+
+        # Resolve work directory from task's repo field
+        if [ -n "$TASK_REPO" ]; then
+            WORK_DIR="$(cd "$CONFIG_DIR" && cd "$TASK_REPO" && pwd)" || {
+                echo "Error: cannot resolve repo path '$TASK_REPO' from $CONFIG_DIR"
+                exit 1
+            }
+        else
+            WORK_DIR="$CONFIG_DIR"
+        fi
+        SANDBOX=$(compute_sandbox_name "$WORK_DIR")
+
+        echo "Task $TASK_ID → $([ -n "$TASK_REPO" ] && echo "$WORK_DIR" || echo "(local)")"
+
+        # ─── Sandbox init ────────────────────────────────────────────
+        if ! echo "$INITIALIZED_SANDBOXES" | grep -qF ":${SANDBOX}:"; then
+            INIT_ARGS=("${PHASE_ARGS[@]}" "${SANDBOX_INIT_EXTRA[@]}")
+            [ "$NEW" = true ] && INIT_ARGS+=(--new)
+            sandbox --agent "$AGENT" "${INIT_ARGS[@]}" --bash "$WORK_DIR" <<< 'exit 0' 2>/dev/null || true
+            INITIALIZED_SANDBOXES="${INITIALIZED_SANDBOXES}:${SANDBOX}:"
+        fi
+
+        # ─── State sync in ──────────────────────────────────────────
+        sync_state_in
+        sandbox_exec "mkdir -p .ralphish" 2>/dev/null
+
+        # Phase 0: Sync — fetch upstream, update base branch
+        sync_phase
+
+        # Phase 1: Worker — implement one task, write summary.yaml
+        worker_prompt="${WORKER_PROMPT//\{\{ITERATION\}\}/$i}"
+        if ! run_phase "worker" "$worker_prompt"; then
+            sync_state_out
+            echo "Worker phase failed"
+            exit 1
+        fi
+        if ! sandbox_exec "test -f .ralphish/summary.yaml" 2>/dev/null; then
+            sync_state_out
+            echo "Worker phase did not produce .ralphish/summary.yaml"
+            exit 1
+        fi
+
+        # Phase 2: Reviewer — review the diff, write review.yaml (retry once)
+        reviewer_ok=false
+        for attempt in 1 2; do
+            if run_phase "reviewer" "$REVIEWER_PROMPT"; then
+                if sandbox_exec "test -f .ralphish/review.yaml" 2>/dev/null; then
+                    reviewer_ok=true
+                    break
+                fi
+            fi
+            [ "$attempt" -eq 1 ] && echo "Reviewer phase failed, retrying..."
+        done
+        if [ "$reviewer_ok" = false ]; then
+            sync_state_out
+            echo "Reviewer phase failed after retry"
+            exit 1
+        fi
+
+        # Phase 3: Orchestrator — update progress.yaml, write context.yaml
+        orch_prompt="${ORCHESTRATOR_PROMPT//\{\{ITERATION\}\}/$i}"
+        orch_rc=0
+        run_phase "orchestrator" "$orch_prompt" || orch_rc=$?
+
+        # ─── State sync out ──────────────────────────────────────────
+        sync_state_out
+
+        # Check signals from orchestrator output
+        if grep -q '<promise>COMPLETE</promise>' "$TMPFILE"; then
+            echo "All tasks complete after $i iterations."
+            exit 0
+        fi
+        if grep -q '<promise>PAUSE</promise>' "$TMPFILE"; then
+            echo "Paused — external action needed. Run ralphish again to resume."
+            exit 0
+        fi
+
+        if [ "$orch_rc" -ne 0 ]; then
+            echo "Orchestrator phase failed (exit code $orch_rc)"
+            exit "$orch_rc"
+        fi
     done
-    echo "Reached max iteration count"
+
+    echo "Reached max iteration count ($MAX_ITERATIONS)"
     ;;
 esac
