@@ -294,7 +294,7 @@ You MUST:
    base_sha: "<40-char sha>"
    head_sha: "<40-char sha>"
    verdict: approve  # or: request_changes
-   test_results: "<pass/fail summary, or 'no test suite found'>"
+   test_results: "<pass/fail summary, or '\''no test suite found'\''>"
    remarks:
      - "<specific remark — reference files and line numbers>"
    ```
