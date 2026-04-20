@@ -89,11 +89,13 @@ def edit_stats(name, inp):
         total_add += new_lines
         total_del += old_lines
         if file_content and first_line is None:
-            needle = new or old
-            if needle:
+            for needle in (new, old):
+                if not needle:
+                    continue
                 idx = file_content.find(needle)
                 if idx >= 0:
                     first_line = file_content.count("\n", 0, idx) + 1
+                    break
 
     suffix = f" +{total_add}/-{total_del}"
     if first_line:
