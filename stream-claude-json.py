@@ -54,8 +54,51 @@ def wrap_in_box(text):
     return textwrap.wrap(text, width=max(box_width(), 20), break_on_hyphens=False)
 
 
-HIDDEN_KEYS = {"old_string", "new_string", "replace_all", "file_path"}
+HIDDEN_KEYS = {"old_string", "new_string", "replace_all", "file_path", "content", "edits"}
 BASH_HIDDEN_KEYS = {"command", "description", "timeout", "run_in_background"}
+
+
+def edit_stats(name, inp):
+    """Return suffix like ' +3/-1 @L42' for Edit/Write/MultiEdit tool calls."""
+    file_path = inp.get("file_path", "")
+    if name == "Write":
+        content = inp.get("content", "")
+        adds = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        return f" +{adds}/-0 @L1"
+    if name == "MultiEdit":
+        edits = inp.get("edits", [])
+    elif name == "Edit":
+        edits = [{"old_string": inp.get("old_string", ""), "new_string": inp.get("new_string", "")}]
+    else:
+        return ""
+
+    try:
+        with open(file_path) as f:
+            file_content = f.read()
+    except (OSError, UnicodeDecodeError):
+        file_content = None
+
+    total_add = 0
+    total_del = 0
+    first_line = None
+    for e in edits:
+        old = e.get("old_string", "")
+        new = e.get("new_string", "")
+        old_lines = old.count("\n") + (1 if old else 0)
+        new_lines = new.count("\n") + (1 if new else 0)
+        total_add += new_lines
+        total_del += old_lines
+        if file_content and first_line is None:
+            needle = new or old
+            if needle:
+                idx = file_content.find(needle)
+                if idx >= 0:
+                    first_line = file_content.count("\n", 0, idx) + 1
+
+    suffix = f" +{total_add}/-{total_del}"
+    if first_line:
+        suffix += f" @L{first_line}"
+    return suffix
 
 
 def format_tool_args(name, inp):
@@ -74,7 +117,7 @@ def format_tool_args(name, inp):
                 inner_parts.append(f"{k}: {'true' if v else 'false'}")
             elif isinstance(v, (int, float)):
                 inner_parts.append(f"{k}: {v}")
-        return prefix, ", ".join(inner_parts)
+        return prefix, ", ".join(inner_parts), ""
     # For tools with file_path, show just the filename unquoted as the first arg
     if "file_path" in inp:
         filename = inp["file_path"].rsplit("/", 1)[-1]
@@ -88,7 +131,8 @@ def format_tool_args(name, inp):
             parts.append(f"{k}: {'true' if v else 'false'}")
         elif isinstance(v, (int, float)):
             parts.append(f"{k}: {v}")
-    return None, ", ".join(parts)
+    suffix = edit_stats(name, inp)
+    return None, ", ".join(parts), suffix
 
 
 parser = argparse.ArgumentParser()
@@ -178,11 +222,11 @@ for line in sys.stdin:
                 tool_id = block.get("id", "")
                 name = block.get("name", "")
                 inp = block.get("input", {})
-                prefix, args = format_tool_args(name, inp)
+                prefix, args, suffix = format_tool_args(name, inp)
                 if prefix:
-                    tool_text = f"{prefix} ({args})"
+                    tool_text = f"{prefix} ({args}){suffix}"
                 else:
-                    tool_text = f"{name}({args})"
+                    tool_text = f"{name}({args}){suffix}"
                 pending_tools[tool_id] = tool_text
                 last_type = "tool_use"
 
