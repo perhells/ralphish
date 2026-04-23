@@ -99,6 +99,7 @@ rm)
     cleanup() {
         trap - INT TERM
         printf '\033[?25h'  # restore cursor
+        printf '\033]0;\007'  # reset terminal title
         echo ""
         echo "Interrupted — aborting sandbox: $SANDBOX"
         pkill -P $$ 2>/dev/null || true
@@ -107,8 +108,9 @@ rm)
         exit 130
     }
     trap cleanup INT TERM
-    trap 'printf "\033[?25h"; rm -f "$TMPFILE"' EXIT
+    trap 'printf "\033[?25h"; printf "\033]0;\007"; rm -f "$TMPFILE"' EXIT
     for ((i=1; i<=MAX_ITERATIONS; i++)); do
+        printf '\033]0;Ralphish - %s [Iteration %d/%d]\007' "$BASENAME" "$i" "$MAX_ITERATIONS"
         docker sandbox exec -t "$SANDBOX" bash -c "
             source ~/.claude/setup.sh &&
             export CLAUDE_CODE_OAUTH_TOKEN='$CC_TOKEN' &&
