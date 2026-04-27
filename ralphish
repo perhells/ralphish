@@ -81,7 +81,7 @@ rm)
     fi
 
     CLAUDE_PROMPT='
-        1. Find the highest priority task from progress.yaml
+        1. Find the highest priority task (the first one that is not done) from progress.yaml
         2. Implement the task
         3. Run all tests/checks for the project and fix any problems
         4. Append your progress to progress.yaml
@@ -121,12 +121,21 @@ rm)
 
         rc=0
         wait "$pid" || rc=$?
-        if [ $rc -ne 0 ] && ! grep -q '<promise>COMPLETE</promise>' "$TMPFILE"; then
+
+        # Extract only assistant text from the stream-json log so the completion
+        # sentinel in the prompt itself doesn't trigger a false match.
+        assistant_text=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$TMPFILE" 2>/dev/null || true)
+        completed=false
+        if printf '%s' "$assistant_text" | grep -q '<promise>COMPLETE</promise>'; then
+            completed=true
+        fi
+
+        if [ $rc -ne 0 ] && [ "$completed" != true ]; then
             echo "Sandbox exec failed (exit code $rc)"
             exit $rc
         fi
 
-      if grep -q '<promise>COMPLETE</promise>' "$TMPFILE"; then
+      if [ "$completed" = true ]; then
         echo "PRD complete after $i iterations."
         exit 0
       fi
