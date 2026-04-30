@@ -297,7 +297,7 @@ rm)
     [ -n "$ENV_FILE" ] && PHASE_ARGS+=(--env-file "$ENV_FILE")
 
     # Extra args for sandbox init (not repeated per phase)
-    SANDBOX_INIT_EXTRA=()
+    SANDBOX_INIT_EXTRA=(--exclude-plugin thedotmack/claude-mem)
     [ "$INCLUDE_LOCAL_CONFIG" = true ] && SANDBOX_INIT_EXTRA+=(--include-local-config)
 
     # ─── Phase prompts ──────────────────────────────────────────────────
